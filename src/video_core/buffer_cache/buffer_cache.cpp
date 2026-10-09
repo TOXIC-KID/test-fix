@@ -947,12 +947,29 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
 }
 
 std::pair<vk::DeviceMemory, u64> BufferCache::AllocateResidency(u64 size) {
-    const auto allocate = [this](u64 allocation_size) {
+    const auto try_allocate = [this](u64 allocation_size) {
         const vk::MemoryAllocateInfo alloc_info = {
             .allocationSize = allocation_size,
             .memoryTypeIndex = arena_memory_type_index,
         };
-        return Vulkan::Check(instance.GetDevice().allocateMemory(alloc_info));
+        return instance.GetDevice().allocateMemory(alloc_info);
+    };
+    // The device can run out of memory when the game makes gigabytes resident at once, which the
+    // texture collector, running once per submit, can't keep up with. Before giving up, free the
+    // textures nobody has used for a while, wait for the GPU so their memory is really released,
+    // and try again.
+    const auto allocate = [&](u64 allocation_size) {
+        auto result = try_allocate(allocation_size);
+        if (result.result == vk::Result::eErrorOutOfDeviceMemory) {
+            LOG_WARNING(Render, "Out of device memory making {} MB resident, freeing textures",
+                        allocation_size >> 20);
+            texture_cache.ReleaseMemoryForAllocation();
+            scheduler.Finish();
+            // The images' memory is freed by operations that wait for the GPU, which is done now.
+            scheduler.PopPendingOperations();
+            result = try_allocate(allocation_size);
+        }
+        return Vulkan::Check(std::move(result));
     };
     // Ranges keep coming as the game streams data in. Carving them out of large chunks keeps the
     // driver from allocating memory each time, which is slow and limited to a few thousand
@@ -961,7 +978,14 @@ std::pair<vk::DeviceMemory, u64> BufferCache::AllocateResidency(u64 size) {
         return {allocate(size), 0};
     }
     if (!residency_chunk || residency_chunk_used + size > RESIDENCY_CHUNK_SIZE) {
-        residency_chunk = allocate(RESIDENCY_CHUNK_SIZE);
+        // A whole chunk may not fit when memory is short, while the range itself still does.
+        auto chunk = try_allocate(RESIDENCY_CHUNK_SIZE);
+        if (chunk.result == vk::Result::eErrorOutOfDeviceMemory) {
+            LOG_WARNING(Render, "No room for a {} MB residency chunk, allocating {} MB instead",
+                        RESIDENCY_CHUNK_SIZE >> 20, size >> 20);
+            return {allocate(size), 0};
+        }
+        residency_chunk = Vulkan::Check(std::move(chunk));
         residency_chunk_used = 0;
     }
     const u64 offset = residency_chunk_used;
