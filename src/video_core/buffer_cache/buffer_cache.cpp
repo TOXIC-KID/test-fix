@@ -958,18 +958,30 @@ std::pair<vk::DeviceMemory, u64> BufferCache::AllocateResidency(u64 size) {
     // texture collector, running once per submit, can't keep up with. Before giving up, free the
     // textures nobody has used for a while, wait for the GPU so their memory is really released,
     // and try again.
+    const auto log_memory = [&](const char* when, u64 allocation_size) {
+        const u64 usage = instance.CanReportMemoryUsage() ? instance.GetDeviceMemoryUsage() : 0;
+        LOG_WARNING(Render,
+                    "Residency allocation of {} MB {}: device memory in use {} MB of budget {} MB, "
+                    "{} MB of it made resident for buffers",
+                    allocation_size >> 20, when, usage >> 20, instance.GetTotalMemoryBudget() >> 20,
+                    residency_allocated_bytes >> 20);
+    };
     const auto allocate = [&](u64 allocation_size) {
         auto result = try_allocate(allocation_size);
         if (result.result == vk::Result::eErrorOutOfDeviceMemory) {
-            LOG_WARNING(Render, "Out of device memory making {} MB resident, freeing textures",
-                        allocation_size >> 20);
+            log_memory("failed", allocation_size);
             texture_cache.ReleaseMemoryForAllocation();
             scheduler.Finish();
             // The images' memory is freed by operations that wait for the GPU, which is done now.
             scheduler.PopPendingOperations();
             result = try_allocate(allocation_size);
+            if (result.result != vk::Result::eSuccess) {
+                log_memory("failed again after freeing textures", allocation_size);
+            }
         }
-        return Vulkan::Check(std::move(result));
+        const auto memory = Vulkan::Check(std::move(result));
+        residency_allocated_bytes += allocation_size;
+        return memory;
     };
     // Ranges keep coming as the game streams data in. Carving them out of large chunks keeps the
     // driver from allocating memory each time, which is slow and limited to a few thousand
@@ -986,6 +998,7 @@ std::pair<vk::DeviceMemory, u64> BufferCache::AllocateResidency(u64 size) {
             return {allocate(size), 0};
         }
         residency_chunk = Vulkan::Check(std::move(chunk));
+        residency_allocated_bytes += RESIDENCY_CHUNK_SIZE;
         residency_chunk_used = 0;
     }
     const u64 offset = residency_chunk_used;
