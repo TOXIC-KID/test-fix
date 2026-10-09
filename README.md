@@ -55,12 +55,6 @@ This repository and branch is a custom build of shadPS4 focused on providing ded
 ---
 VRAM FIX FOR 4GB VRAM
 
-- **FSR:** Kesinlikle açılmamalı, grafiksel bozulmalara yol açıyor.
-- **Debug:**
-  - **Readbacks Mode:** Değeri `Precise` olmalı.
-  - **Enable Direct Memory Access:** Açık olmalı.
-  - **Enable Shader Cache:** Açık olmalı.
-- **Vblank Frequency:** İstenilen kare hızına göre ayarlanmış olmalı.
 
 ---
 
