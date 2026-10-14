@@ -389,6 +389,8 @@ jobs:
         gh release edit "$VERSION" --repo "$GITHUB_REPOSITORY" --notes-file notes.md
 
   macos-sdl:
+    # Disabled: only the Windows build is used.
+    if: ${{ false }}
     runs-on: macos-26
     needs: get-info
     steps:
@@ -449,6 +451,8 @@ jobs:
         path: upload/
 
   linux-sdl:
+    # Disabled: only the Windows build is used.
+    if: ${{ false }}
     runs-on: ubuntu-24.04
     needs: get-info
     steps:
