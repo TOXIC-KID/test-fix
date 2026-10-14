@@ -114,6 +114,7 @@ bool Rasterizer::FilterDraw() {
         // TODO: check for a valid MRT1 to promote the draw to the resolve pass.
         LOG_TRACE(Render_Vulkan, "FMask decompression pass skipped");
         ScopedMarkerInsert("FmaskDecompress");
+        EliminateFastClear();
         return false;
     }
     if (regs.color_control.mode == AmdGpu::ColorControl::OperationMode::Resolve) {
@@ -356,6 +357,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     const DrawIndirectParams params = {
         .vertex_sgpr_offset = vertex_sgpr_offset,
         .instance_sgpr_offset = instance_sgpr_offset,
+        .is_indirect = true,
     };
     const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline(params);
     if (!pipeline) {
@@ -379,14 +381,19 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     const auto [buffer, base] =
         buffer_cache.ObtainBuffer(arg_address + offset, stride * max_count, false);
     needs_barrier |= runtime.IsBufferAccessed(buffer, base, stride * max_count);
-    runtime.NoteBufferRead(buffer, base, stride * max_count);
+    // Recorded as a read (not just noted), so a later write to the arguments gets a barrier.
+    runtime.AccessBuffer(buffer, base, stride * max_count,
+                         vk::PipelineStageFlagBits2::eDrawIndirect,
+                         vk::AccessFlagBits2::eShaderRead);
 
     const VideoCore::Buffer* count_buffer;
     u64 count_offset;
     if (count_address != 0) {
         std::tie(count_buffer, count_offset) = buffer_cache.ObtainBuffer(count_address, 4, false);
         needs_barrier |= runtime.IsBufferAccessed(count_buffer, count_offset, 4);
-        runtime.NoteBufferRead(count_buffer, count_offset, 4);
+        runtime.AccessBuffer(count_buffer, count_offset, 4,
+                             vk::PipelineStageFlagBits2::eDrawIndirect,
+                             vk::AccessFlagBits2::eShaderRead);
     }
 
     scheduler.MarkWorkRun(false);
@@ -578,7 +585,8 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
 
     const auto [buffer, base] = buffer_cache.ObtainBuffer(address + offset, size, false);
     needs_barrier |= runtime.IsBufferAccessed(buffer, base, size);
-    runtime.NoteBufferRead(buffer, base, size);
+    runtime.AccessBuffer(buffer, base, size, vk::PipelineStageFlagBits2::eDrawIndirect,
+                         vk::AccessFlagBits2::eShaderRead);
 
     scheduler.MarkWorkRun(true);
     scheduler.MarkDispatch(Scheduler::DispatchMark::Begin,
