@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <source_location>
 #include "common/interval_set.h"
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
@@ -92,7 +93,7 @@ public:
     /// read memory in ways not reported.
     bool IsTouchedInSession(const VideoCore::Buffer* handle, u64 offset, u64 size) const;
 
-    void FlushBarriers();
+    void FlushBarriers(std::source_location caller = std::source_location::current());
 
     /// Sets the scheduler of the second queue the game's compute rings run on, if any. Uploads
     /// nothing the graphics queue still has in flight touches go there too.
