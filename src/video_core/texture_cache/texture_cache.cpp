@@ -697,6 +697,32 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
     return image.FindView(desc.view_info, false);
 }
 
+void TextureCache::AssociateStencil(ImageId depth_id, const ImageInfo& depth_info) {
+    // If there is a stencil attachment, link depth and stencil.
+    Image& depth_image = slot_images[depth_id];
+    if (depth_info.stencil_addr != 0) {
+        ImageId stencil_id{};
+        ForEachImageStartingAt(
+            depth_info.stencil_addr, depth_info.stencil_size, [&](ImageId image_id, Image& candidate) {
+                if (candidate.info.pixel_format == vk::Format::eUndefined ||
+                    Vulkan::LiverpoolToVK::IsFormatStencilCompatible(candidate.info.pixel_format)) {
+                    stencil_id = image_id;
+                }
+            });
+        if (!stencil_id) {
+            ImageInfo info{};
+            info.guest_address = depth_info.stencil_addr;
+            info.guest_size = depth_info.stencil_size;
+            info.size = depth_info.size;
+            stencil_id = slot_images.Insert(instance, runtime, slot_image_views, info);
+            RegisterImage(stencil_id);
+        }
+        Image& stencil_image = slot_images[stencil_id];
+        TouchImage(stencil_image);
+        stencil_image.AssociateDepth(depth_id, depth_image.image_uid);
+    }
+}
+
 ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
     image.flags |= ImageFlagBits::GpuModified;
@@ -711,28 +737,7 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
         image.info.meta_info.htile_addr = desc.info.meta_info.htile_addr;
     }
 
-    // If there is a stencil attachment, link depth and stencil.
-    if (desc.info.stencil_addr != 0) {
-        ImageId stencil_id{};
-        ForEachImageStartingAt(
-            desc.info.stencil_addr, desc.info.stencil_size, [&](ImageId image_id, Image& image) {
-                if (image.info.pixel_format == vk::Format::eUndefined ||
-                    Vulkan::LiverpoolToVK::IsFormatStencilCompatible(image.info.pixel_format)) {
-                    stencil_id = image_id;
-                }
-            });
-        if (!stencil_id) {
-            ImageInfo info{};
-            info.guest_address = desc.info.stencil_addr;
-            info.guest_size = desc.info.stencil_size;
-            info.size = desc.info.size;
-            stencil_id = slot_images.Insert(instance, runtime, slot_image_views, info);
-            RegisterImage(stencil_id);
-        }
-        Image& stencil_image = slot_images[stencil_id];
-        TouchImage(stencil_image);
-        stencil_image.AssociateDepth(image_id, image.image_uid);
-    }
+    AssociateStencil(image_id, desc.info);
 
     return image.FindView(desc.view_info, false);
 }
