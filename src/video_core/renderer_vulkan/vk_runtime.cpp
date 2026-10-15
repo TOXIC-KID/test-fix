@@ -394,7 +394,7 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
                                   const VideoCore::Buffer* buffer, u64 offset) {
     const u32 num_mips = std::min(src->info.resources.levels, dst->info.resources.levels);
     const u32 num_layers = std::min(src->info.resources.layers, dst->info.resources.layers);
-    ASSERT(src->info.resources.layers == dst->info.resources.layers && num_mips == 1);
+    ASSERT(num_mips == 1);
 
     SetBackingSamples(dst, dst->info.num_samples, false);
     SetBackingSamples(src, src->info.num_samples);
@@ -504,8 +504,9 @@ void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32
 
 void Runtime::CopyColorAndDepth(VideoCore::Image* src, VideoCore::Image* dst) {
     if (src->info.num_samples == 1 && dst->info.num_samples == 1) {
-        if (instance.IsMaintenance8Supported() ||
-            src->info.props.is_depth == dst->info.props.is_depth) {
+        if ((instance.IsMaintenance8Supported() ||
+             src->info.props.is_depth == dst->info.props.is_depth) &&
+            src->aspect_mask == dst->aspect_mask) {
             CopyImage(src, dst);
         } else {
             // Perform depth from/to color copy using the intermediate copy buffer.

@@ -102,8 +102,12 @@ void IREmitter::Discard(const U1& cond) {
     Inst(Opcode::DiscardCond, cond);
 }
 
-void IREmitter::Barrier() {
-    Inst(Opcode::Barrier);
+void IREmitter::Barrier(bool buffers) {
+    Inst(Opcode::Barrier, Flags{buffers});
+}
+
+void IREmitter::SubgroupBarrier() {
+    Inst(Opcode::SubgroupBarrier);
 }
 
 void IREmitter::WorkgroupMemoryBarrier() {

@@ -67,6 +67,16 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
     critical_gc_memory = static_cast<u64>(
         std::max<s64>(std::min(device_local_memory - min_vacancy_critical, min_spacing_critical),
                       min_critical_floor));
+    // Buffer memory comes in large ranges that the collector, which runs once per submit and
+    // only frees old images, can't make room for in time. On small cards, start collecting
+    // earlier so a gigabyte of headroom is left.
+    if (device_local_memory <= static_cast<s64>(SMALL_CARD_MEMORY)) {
+        const s64 headroom_critical =
+            std::max<s64>(device_local_memory - static_cast<s64>(RESIDENCY_HEADROOM),
+                          min_critical_floor);
+        critical_gc_memory = std::min(critical_gc_memory, static_cast<u64>(headroom_critical));
+        pressure_gc_memory = std::min(pressure_gc_memory, critical_gc_memory);
+    }
     trigger_gc_memory = static_cast<u64>((device_local_memory - mem_threshold) / 2);
     // On cards with plenty of memory, leave the cache alone until it fills a good part of it.
     // Collecting from a few GB on dropped textures the game went on to use again a moment
@@ -260,6 +270,11 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, Bindi
         // Inherit image usage
         auto& new_image = slot_images[new_image_id];
         new_image.usage = cache_image.usage;
+        if (new_info.num_samples == 1 &&
+            (new_info.resources.layers > cache_image.info.resources.layers ||
+             new_info.resources.levels > cache_image.info.resources.levels)) {
+            RefreshImage(new_image);
+        }
         new_image.flags &= ~ImageFlagBits::Dirty;
         // When creating a depth buffer through overlap resolution don't clear it on first use.
         new_image.info.meta_info.htile_clear_mask = 0;
@@ -682,6 +697,32 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
     return image.FindView(desc.view_info, false);
 }
 
+void TextureCache::AssociateStencil(ImageId depth_id, const ImageInfo& depth_info) {
+    // If there is a stencil attachment, link depth and stencil.
+    Image& depth_image = slot_images[depth_id];
+    if (depth_info.stencil_addr != 0) {
+        ImageId stencil_id{};
+        ForEachImageStartingAt(
+            depth_info.stencil_addr, depth_info.stencil_size, [&](ImageId image_id, Image& candidate) {
+                if (candidate.info.pixel_format == vk::Format::eUndefined ||
+                    Vulkan::LiverpoolToVK::IsFormatStencilCompatible(candidate.info.pixel_format)) {
+                    stencil_id = image_id;
+                }
+            });
+        if (!stencil_id) {
+            ImageInfo info{};
+            info.guest_address = depth_info.stencil_addr;
+            info.guest_size = depth_info.stencil_size;
+            info.size = depth_info.size;
+            stencil_id = slot_images.Insert(instance, runtime, slot_image_views, info);
+            RegisterImage(stencil_id);
+        }
+        Image& stencil_image = slot_images[stencil_id];
+        TouchImage(stencil_image);
+        stencil_image.AssociateDepth(depth_id, depth_image.image_uid);
+    }
+}
+
 ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
     image.flags |= ImageFlagBits::GpuModified;
@@ -696,28 +737,7 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
         image.info.meta_info.htile_addr = desc.info.meta_info.htile_addr;
     }
 
-    // If there is a stencil attachment, link depth and stencil.
-    if (desc.info.stencil_addr != 0) {
-        ImageId stencil_id{};
-        ForEachImageStartingAt(
-            desc.info.stencil_addr, desc.info.stencil_size, [&](ImageId image_id, Image& image) {
-                if (image.info.pixel_format == vk::Format::eUndefined ||
-                    Vulkan::LiverpoolToVK::IsFormatStencilCompatible(image.info.pixel_format)) {
-                    stencil_id = image_id;
-                }
-            });
-        if (!stencil_id) {
-            ImageInfo info{};
-            info.guest_address = desc.info.stencil_addr;
-            info.guest_size = desc.info.stencil_size;
-            info.size = desc.info.size;
-            stencil_id = slot_images.Insert(instance, runtime, slot_image_views, info);
-            RegisterImage(stencil_id);
-        }
-        Image& stencil_image = slot_images[stencil_id];
-        TouchImage(stencil_image);
-        stencil_image.AssociateDepth(image_id, image.image_uid);
-    }
+    AssociateStencil(image_id, desc.info);
 
     return image.FindView(desc.view_info, false);
 }
@@ -1115,6 +1135,29 @@ void TextureCache::RunGarbageCollector() {
     GarbageCollectImages();
     GarbageCollectSamplers();
     ++gc_tick;
+}
+
+bool TextureCache::ReleaseMemoryForAllocation() {
+    // Only images unused for as long as the collector's gentlest pass waits go, so the ones the
+    // guest is still drawing with stay.
+    const u64 ticks_to_destroy = std::min<u64>(16, gc_tick);
+    size_t num_freed = 0;
+    image_lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, [&](Image& image) {
+        const bool download = image.SafeToDownload();
+        if (image.info.IsTiled() && download) {
+            // Can't handle non-linear image downloads, same as the collector.
+            return false;
+        }
+        const auto image_id = slot_images.GetSlotId(image);
+        if (download) {
+            DownloadImageMemory(image_id);
+        }
+        FreeImage(image_id);
+        ++num_freed;
+        return false;
+    });
+    LOG_INFO(Render_Vulkan, "Texture cache: freed {} images for an allocation", num_freed);
+    return num_freed != 0;
 }
 
 void TextureCache::DeleteImage(ImageId image_id) {
