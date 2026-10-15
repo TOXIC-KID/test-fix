@@ -1,6 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <vector>
+#include <tuple>
+#include <string>
+#include <mutex>
+#include <map>
+#include <chrono>
 #include <algorithm>
 #include <span>
 
@@ -394,7 +400,7 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
                                   const VideoCore::Buffer* buffer, u64 offset) {
     const u32 num_mips = std::min(src->info.resources.levels, dst->info.resources.levels);
     const u32 num_layers = std::min(src->info.resources.layers, dst->info.resources.layers);
-    ASSERT(src->info.resources.layers == dst->info.resources.layers && num_mips == 1);
+    ASSERT(num_mips == 1);
 
     SetBackingSamples(dst, dst->info.num_samples, false);
     SetBackingSamples(src, src->info.num_samples);
@@ -504,8 +510,9 @@ void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32
 
 void Runtime::CopyColorAndDepth(VideoCore::Image* src, VideoCore::Image* dst) {
     if (src->info.num_samples == 1 && dst->info.num_samples == 1) {
-        if (instance.IsMaintenance8Supported() ||
-            src->info.props.is_depth == dst->info.props.is_depth) {
+        if ((instance.IsMaintenance8Supported() ||
+             src->info.props.is_depth == dst->info.props.is_depth) &&
+            src->aspect_mask == dst->aspect_mask) {
             CopyImage(src, dst);
         } else {
             // Perform depth from/to color copy using the intermediate copy buffer.
@@ -871,7 +878,63 @@ bool Runtime::CopyBufferOnAsync(const VideoCore::Buffer* src, const VideoCore::B
     return true;
 }
 
-void Runtime::FlushBarriers() {
+namespace {
+// Diagnostics: which call sites record the barriers, and what they wait for.
+struct BarrierSite {
+    u64 count{};
+    u64 with_images{};
+};
+std::mutex barrier_stats_mutex;
+std::map<std::tuple<std::string, u32, u64>, BarrierSite> barrier_stats;
+std::chrono::steady_clock::time_point barrier_stats_report;
+
+void NoteBarrier(const std::source_location& caller, vk::PipelineStageFlags2 src_stage,
+                 bool with_images) {
+    std::scoped_lock lock{barrier_stats_mutex};
+    std::string file = caller.file_name();
+    if (const auto slash = file.find_last_of("/\\"); slash != std::string::npos) {
+        file = file.substr(slash + 1);
+    }
+    auto& site = barrier_stats[{file, caller.line(), static_cast<u64>(src_stage)}];
+    ++site.count;
+    site.with_images += with_images ? 1 : 0;
+
+    const auto now = std::chrono::steady_clock::now();
+    if (barrier_stats_report == std::chrono::steady_clock::time_point{}) {
+        barrier_stats_report = now;
+    }
+    if (now - barrier_stats_report < std::chrono::seconds{10}) {
+        return;
+    }
+    const double seconds = std::chrono::duration<double>(now - barrier_stats_report).count();
+    barrier_stats_report = now;
+    std::vector<std::pair<u64, std::string>> sorted;
+    u64 total{};
+    for (const auto& [key, value] : barrier_stats) {
+        total += value.count;
+    }
+    for (const auto& [key, value] : barrier_stats) {
+        sorted.emplace_back(
+            value.count,
+            fmt::format("{}:{} waits for [{}] {:.0f}/s ({:.0f}%{})", std::get<0>(key),
+                        std::get<1>(key), vk::to_string(vk::PipelineStageFlags2(std::get<2>(key))),
+                        static_cast<double>(value.count) / seconds,
+                        100.0 * static_cast<double>(value.count) / static_cast<double>(total),
+                        value.with_images ? fmt::format(", {} with image barriers", value.with_images)
+                                          : std::string{}));
+    }
+    std::ranges::sort(sorted, [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::string report;
+    for (size_t i = 0; i < std::min<size_t>(12, sorted.size()); ++i) {
+        report += fmt::format("\n    {}", sorted[i].second);
+    }
+    LOG_INFO(Render_Vulkan, "Barriers by where they were recorded, {:.0f}/s in all:{}",
+             static_cast<double>(total) / seconds, report);
+    barrier_stats.clear();
+}
+} // namespace
+
+void Runtime::FlushBarriers(std::source_location caller) {
     vk::DependencyInfo dep_info{};
 
     if (memory_barrier.srcStageMask) {
@@ -887,6 +950,7 @@ void Runtime::FlushBarriers() {
         return;
     }
 
+    NoteBarrier(caller, memory_barrier.srcStageMask, !image_barriers.empty());
     scheduler.EndRendering();
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.pipelineBarrier2(dep_info);
