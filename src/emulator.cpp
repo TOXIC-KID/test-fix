@@ -469,6 +469,9 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
 
     LOG_INFO(Config, "Game-specific config used: {}",
              EmulatorState::GetInstance()->IsGameSpecifigConfigUsed());
+    LOG_INFO(Config, "Settings files are read from {} and {}",
+             Common::FS::GetUserPathString(Common::FS::PathType::UserDir),
+             Common::FS::GetUserPathString(Common::FS::PathType::CustomConfigs));
 
     LOG_INFO(Config, "General isNeo: {}", EmulatorSettings.IsNeo());
     LOG_INFO(Config, "General isDevKit: {}", EmulatorSettings.IsDevKit());
