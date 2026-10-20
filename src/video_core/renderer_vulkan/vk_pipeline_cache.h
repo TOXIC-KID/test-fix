@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <filesystem>
+
 #include <array>
 #include <bit>
 #include <variant>
@@ -208,6 +210,9 @@ private:
     }
 
 private:
+    std::filesystem::path DriverCachePath() const;
+    void SaveDriverCache();
+
     const Instance& instance;
     Scheduler& scheduler;
     AmdGpu::Liverpool* liverpool;

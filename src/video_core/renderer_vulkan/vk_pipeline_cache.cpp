@@ -19,6 +19,8 @@
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/cache_storage.h"
+#include "common/elf_info.h"
+#include "video_core/renderer_vulkan/driver_cache_data.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
@@ -363,7 +365,35 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .supports_shader_stencil_export = instance_.IsShaderStencilExportSupported(),
     };
 
-    auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
+    // Persistent driver pipeline cache: lets the driver skip recompiling shaders across launches.
+    std::vector<u8> cache_file_data;
+    std::span<const u8> initial_data;
+    {
+        const auto path = DriverCachePath();
+        Common::FS::IOFile file{path, Common::FS::FileAccessMode::Read};
+        if (file.IsOpen()) {
+            cache_file_data.resize(file.GetSize());
+            if (file.Read(cache_file_data) == cache_file_data.size()) {
+                const auto uuid = instance.GetPipelineCacheUUID();
+                initial_data = UnpackDriverCache(
+                    cache_file_data, instance.GetVendorID(), instance.GetDeviceID(),
+                    std::span<const u8>{reinterpret_cast<const u8*>(uuid.data()), uuid.size()});
+            }
+        }
+    }
+    vk::PipelineCacheCreateInfo cache_info{};
+    if (!initial_data.empty()) {
+        cache_info.initialDataSize = initial_data.size();
+        cache_info.pInitialData = initial_data.data();
+    }
+    auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique(cache_info);
+    if (cache_result != vk::Result::eSuccess && !initial_data.empty()) {
+        LOG_WARNING(Render_Vulkan, "Driver pipeline cache rejected, starting empty");
+        std::tie(cache_result, cache) = instance.GetDevice().createPipelineCacheUnique({});
+    } else if (!initial_data.empty()) {
+        LOG_INFO(Render_Vulkan, "Loaded driver pipeline cache ({} KiB)",
+                 initial_data.size() / 1024);
+    }
     ASSERT_MSG(cache_result == vk::Result::eSuccess, "Failed to create pipeline cache: {}",
                vk::to_string(cache_result));
     pipeline_cache = std::move(cache);
@@ -376,7 +406,43 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     WarmUp();
 }
 
-PipelineCache::~PipelineCache() = default;
+std::filesystem::path PipelineCache::DriverCachePath() const {
+    const auto serial = std::string(Common::ElfInfo::Instance().GameSerial());
+    return Common::FS::GetUserPath(Common::FS::PathType::CacheDir) / (serial + ".vkcache");
+}
+
+void PipelineCache::SaveDriverCache() {
+    if (!pipeline_cache) {
+        return;
+    }
+    auto [result, data] = instance.GetDevice().getPipelineCacheData(*pipeline_cache);
+    if (result != vk::Result::eSuccess || data.empty()) {
+        return;
+    }
+    const auto packed = PackDriverCache(std::span<const u8>{data.data(), data.size()});
+    const auto path = DriverCachePath();
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+    auto tmp = path;
+    tmp += ".tmp";
+    {
+        Common::FS::IOFile file{tmp, Common::FS::FileAccessMode::Write};
+        if (!file.IsOpen() || file.Write(packed) != packed.size()) {
+            return;
+        }
+    }
+    std::filesystem::rename(tmp, path, ec);
+    if (ec) {
+        std::filesystem::remove(tmp, ec);
+        return;
+    }
+    LOG_INFO(Render_Vulkan, "Saved driver pipeline cache ({} KiB)", packed.size() / 1024);
+}
+
+PipelineCache::~PipelineCache() {
+    compiler.reset(); // join workers so no pipeline is mid-creation
+    SaveDriverCache();
+}
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
     draw_indirect_params = params;
