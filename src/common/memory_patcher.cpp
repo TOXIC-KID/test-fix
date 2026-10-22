@@ -3,9 +3,12 @@
 
 #include <algorithm>
 #include <codecvt>
+#include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <vector>
 #include <nlohmann/json.hpp>
 #include <pugixml.hpp>
 #include "common/elf_info.h"
@@ -220,7 +223,175 @@ void ApplyPatchesFromXML(std::filesystem::path path) {
     }
 }
 
+// Game-specific speed patches for inFAMOUS Second Son (CUSA00004, update 1.07), ported from
+// github.com/axylpup/shadPS4. All of them are off unless switched on, and each one compares every
+// byte it is about to change first and does nothing at all if any byte differs.
+//
+// Switch them on with an environment variable or a line NAME=VALUE in
+// <shadPS4 user folder>\shadps4-flags.txt (a '#' starts a comment):
+//   SHADPS4_PERF_MODE=low              the game's own lower settings (less GPU work and video memory)
+//   SHADPS4_PARTICLE_LATE_READ=1       read particle results one frame later (no mid-frame GPU wait)
+//   SHADPS4_PARTICLE_LIGHT_ONE_SUBMIT=1  one ring submit instead of one per light (needs the above)
+static std::string GetPatchFlag(const char* name) {
+    if (const char* env = std::getenv(name)) {
+        return env;
+    }
+    std::ifstream file(Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "shadps4-flags.txt");
+    std::string line;
+    while (std::getline(file, line)) {
+        const auto hash = line.find('#');
+        if (hash != std::string::npos) {
+            line.resize(hash);
+        }
+        const auto eq = line.find('=');
+        if (eq == std::string::npos) {
+            continue;
+        }
+        const auto trim = [](std::string s) {
+            const auto b = s.find_first_not_of(" \t\r");
+            const auto e = s.find_last_not_of(" \t\r");
+            return b == std::string::npos ? std::string{} : s.substr(b, e - b + 1);
+        };
+        if (trim(line.substr(0, eq)) == name) {
+            return trim(line.substr(eq + 1));
+        }
+    }
+    return {};
+}
+
+struct PatchSite {
+    u64 offset;
+    std::vector<u8> original;
+    std::vector<u8> value;
+    const char* what;
+};
+
+// True and applies every site only if all original bytes match.
+static bool ApplySites(const char* tag, const std::vector<PatchSite>& sites) {
+    for (const auto& s : sites) {
+        if (std::memcmp(reinterpret_cast<const void*>(g_eboot_address + s.offset),
+                        s.original.data(), s.original.size()) != 0) {
+            LOG_ERROR(Loader, "{}: not applied, {} at eboot+{:#x} differs (needs CUSA00004 1.07)",
+                      tag, s.what, s.offset);
+            return false;
+        }
+    }
+    for (const auto& s : sites) {
+        std::memcpy(reinterpret_cast<void*>(g_eboot_address + s.offset), s.value.data(),
+                    s.value.size());
+    }
+    return true;
+}
+
+static bool g_particle_late_read_applied = false;
+
+// The game reads its particle control blocks (survivor counts, light counts, collision) right
+// after kicking the frame's particle work, so Game:Main waits for the GPU mid-frame. This moves
+// that read to the start of the next frame, just before the data is consumed.
+static void ApplyParticleLateRead() {
+    if (GetPatchFlag("SHADPS4_PARTICLE_LATE_READ") != "1") {
+        return;
+    }
+    const std::vector<PatchSite> sites = {
+        // Cave in the unreferenced function at 0x3ee160: readback, collision join, then the
+        // arguments of 0x3ee7d0 and a jump back.
+        {0x3ee160,
+         {0x55, 0x48, 0x89, 0xe5, 0x53, 0x50, 0x48, 0x8b, 0x5f, 0x58, 0xeb, 0x13, 0x0f, 0x1f, 0x40, 0x00,
+          0x48, 0x89, 0xdf, 0xe8, 0x58, 0x5d, 0x00, 0x00, 0x48, 0x8b, 0x9b, 0xb0, 0x00, 0x00, 0x00, 0x48,
+          0x85, 0xdb, 0x75, 0xec, 0x48, 0x83, 0xc4, 0x08, 0x5b, 0x5d, 0xc3, 0x90, 0x90, 0x90, 0x90, 0x90},
+         {0x48, 0x8d, 0x1d, 0xa9, 0x09, 0x95, 0x07, 0x48, 0x89, 0xdf, 0xe8, 0x81, 0xfd, 0xff, 0xff, 0x48,
+          0x89, 0xdf, 0xe8, 0xf9, 0x02, 0x00, 0x00, 0x48, 0x8d, 0x05, 0x52, 0xdb, 0xb2, 0x00, 0x48, 0x89,
+          0xdf, 0x48, 0x8b, 0xb0, 0xa0, 0xdc, 0x01, 0x00, 0xe9, 0x11, 0xeb, 0xea, 0xff},
+         "readback cave"},
+        // Main loop: jump to the cave, NOPs up to the call of 0x3ee7d0.
+        {0x29cc84,
+         {0xe8, 0x47, 0xec, 0x17, 0x00, 0x48, 0x8d, 0x05, 0x40, 0xf0, 0xc7, 0x00, 0x48, 0x8d, 0x3d, 0x79,
+          0x1e, 0xaa, 0x07, 0x48, 0x8b, 0xb0, 0xa0, 0xdc, 0x01, 0x00, 0xe8, 0x2d, 0x1b, 0x15, 0x00},
+         {0xe8, 0x47, 0xec, 0x17, 0x00, 0xe9, 0xd2, 0x14, 0x15, 0x00, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+          0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0xe8, 0x2d, 0x1b, 0x15, 0x00},
+         "main loop jump"},
+        // The old readback call becomes a 5-byte NOP.
+        {0x29cd14,
+         {0x48, 0x8d, 0x1d, 0xf5, 0x1d, 0xaa, 0x07, 0x48, 0x89, 0xdf, 0xe8, 0xcd, 0x11, 0x15, 0x00},
+         {0x48, 0x8d, 0x1d, 0xf5, 0x1d, 0xaa, 0x07, 0x48, 0x89, 0xdf, 0x0f, 0x1f, 0x44, 0x00, 0x00},
+         "old readback call"},
+        // Checked only (the end-of-frame join stays as it is).
+        {0x29cd53,
+         {0x48, 0x89, 0xdf, 0xe8, 0x15, 0x17, 0x15, 0x00},
+         {0x48, 0x89, 0xdf, 0xe8, 0x15, 0x17, 0x15, 0x00},
+         "end-of-frame join"},
+    };
+    if (ApplySites("SHADPS4_PARTICLE_LATE_READ", sites)) {
+        g_particle_late_read_applied = true;
+        LOG_INFO(Loader, "SHADPS4_PARTICLE_LATE_READ: applied (particle readback one frame later)");
+    }
+}
+
+// The game records two DMA copies per light-emitting particle effect and submits the ring after
+// each one (about 25 submits per fight frame). With the late read the copies go out with the
+// frame's first submit anyway, so the per-light submit becomes a NOP.
+static void ApplyParticleLightOneSubmit() {
+    if (GetPatchFlag("SHADPS4_PARTICLE_LIGHT_ONE_SUBMIT") != "1") {
+        return;
+    }
+    if (!g_particle_late_read_applied) {
+        LOG_ERROR(Loader, "SHADPS4_PARTICLE_LIGHT_ONE_SUBMIT: not applied, needs "
+                          "SHADPS4_PARTICLE_LATE_READ to be applied first");
+        return;
+    }
+    const std::vector<PatchSite> sites = {
+        {0x3f4036, {0xe8, 0xa5, 0x51, 0xd7, 0xff}, {0x0f, 0x1f, 0x44, 0x00, 0x00}, "light submit"},
+    };
+    if (ApplySites("SHADPS4_PARTICLE_LIGHT_ONE_SUBMIT", sites)) {
+        LOG_INFO(Loader, "SHADPS4_PARTICLE_LIGHT_ONE_SUBMIT: per-light ring submit removed");
+    }
+}
+
+// SHADPS4_PERF_MODE=low (or 1) / office (or 2): the game has a ladder of 21 quality rows that it
+// only climbs when a frame overflows its GPU command memory. A preset is written into row 0, so
+// the game's own code runs it. Also: the low-resolution particle pass is forced, and fewer
+// high-resolution texture blocks are kept (less video memory).
+//   low:    LOD scale 0.7, one sun-shadow cascade less, particles at half resolution, 2 hi-res blocks
+//   office: LOD scale 0.5, one cascade less, particles at quarter resolution, no hi-res blocks,
+//           half the pedestrians
+static void ApplyPerfMode() {
+    const std::string mode = GetPatchFlag("SHADPS4_PERF_MODE");
+    const bool low = mode == "low" || mode == "1";
+    const bool office = mode == "office" || mode == "2";
+    if (!low && !office) {
+        return;
+    }
+    const std::vector<u8> row0 = {0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x24,
+                                  0x74, 0x49, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+    std::vector<u8> row = row0;
+    const float lod = low ? 0.7f : 0.5f;
+    std::memcpy(row.data(), &lod, 4);
+    const s32 cascades = -1;
+    std::memcpy(row.data() + 4, &cascades, 4);
+    const u8 particle_level = low ? 1 : 2; // resolution 1.0 / 0.5 / 0.25
+    const u8 hires_slots = low ? 2 : 0;
+    std::vector<PatchSite> sites = {
+        {0xda08c0, row0, row, "quality ladder row 0"},
+        {0x3ed6b0, {0x74, 0x0f}, {0x90, 0x90}, "particle level: always set"},
+        {0x3ed6b8, {0x00, 0x00, 0x00, 0x00}, {particle_level, 0x00, 0x00, 0x00}, "particle level"},
+        {0xfe9a2, {0x04}, {hires_slots}, "high-res texture slots (mov)"},
+        {0xfe9b2, {0x04}, {hires_slots}, "high-res texture slots (cmp)"},
+    };
+    if (office) {
+        sites.push_back({0x40ca01, {0x00, 0x00, 0x80, 0x3f}, {0x00, 0x00, 0x00, 0x3f},
+                         "pedestrian ratio 0"});
+        sites.push_back({0x40c83f, {0x00, 0x00, 0x80, 0x3f}, {0x00, 0x00, 0x00, 0x3f},
+                         "pedestrian ratio 1"});
+    }
+    if (ApplySites("SHADPS4_PERF_MODE", sites)) {
+        LOG_INFO(Loader, "SHADPS4_PERF_MODE={}: applied", mode);
+    }
+}
+
 void OnGameLoaded() {
+    ApplyParticleLateRead();
+    ApplyParticleLightOneSubmit();
+    ApplyPerfMode();
     std::filesystem::path patch_dir = Common::FS::GetUserPath(Common::FS::PathType::PatchesDir);
     if (!patch_file.empty()) {
 

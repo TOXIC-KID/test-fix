@@ -760,17 +760,32 @@ void ControllerOutput::FinalizeUpdate(u8 gamepad_index) {
     if (button != SDL_GAMEPAD_BUTTON_INVALID) {
         switch (button) {
         case SDL_GAMEPAD_BUTTON_TOUCHPAD_LEFT:
-            controller->SetTouchpadState(0, new_button_state, 0.25f, 0.5f);
-            controller->Button(SDLGamepadToOrbisButton(button), new_button_state);
-            break;
         case SDL_GAMEPAD_BUTTON_TOUCHPAD_CENTER:
-            controller->SetTouchpadState(0, new_button_state, 0.50f, 0.5f);
-            controller->Button(SDLGamepadToOrbisButton(button), new_button_state);
+        case SDL_GAMEPAD_BUTTON_TOUCHPAD_RIGHT: {
+            // Each held touchpad key is its own finger: the first on touch 0, a second one on
+            // touch 1, and the touchpad button stays down while any of them is held. Scenes that
+            // need both halves held (the car in Reggie's scene) got one touch when all three keys
+            // shared touch 0. Ported from github.com/axylpup/shadPS4.
+            static int finger_of[3] = {-1, -1, -1};
+            const int k = button == SDL_GAMEPAD_BUTTON_TOUCHPAD_LEFT     ? 0
+                          : button == SDL_GAMEPAD_BUTTON_TOUCHPAD_CENTER ? 1
+                                                                         : 2;
+            const float x = k == 0 ? 0.25f : k == 1 ? 0.50f : 0.75f;
+            if (new_button_state) {
+                if (finger_of[k] < 0) {
+                    const bool zero_taken =
+                        finger_of[(k + 1) % 3] == 0 || finger_of[(k + 2) % 3] == 0;
+                    finger_of[k] = zero_taken ? 1 : 0;
+                }
+                controller->SetTouchpadState(finger_of[k], true, x, 0.5f);
+            } else if (finger_of[k] >= 0) {
+                controller->SetTouchpadState(finger_of[k], false, x, 0.5f);
+                finger_of[k] = -1;
+            }
+            const bool any = finger_of[0] >= 0 || finger_of[1] >= 0 || finger_of[2] >= 0;
+            controller->Button(SDLGamepadToOrbisButton(button), any);
             break;
-        case SDL_GAMEPAD_BUTTON_TOUCHPAD_RIGHT:
-            controller->SetTouchpadState(0, new_button_state, 0.75f, 0.5f);
-            controller->Button(SDLGamepadToOrbisButton(button), new_button_state);
-            break;
+        }
         case SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE_LEFT:
             if (new_button_state) {
                 LOG_INFO(Input, "touchpad swipe output fired");
