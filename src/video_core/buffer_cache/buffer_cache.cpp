@@ -2,7 +2,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <bit>
+#include <map>
+#include <string>
+#include <vector>
 #include <magic_enum/magic_enum.hpp>
 
 #include "common/alignment.h"
@@ -198,6 +203,102 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
     });
 }
 
+namespace {
+
+// Diagnostic: where game threads lose time waiting for the GPU's data. Every game thread fault
+// that had to wait for a copy back is billed to the 1 MiB block of guest memory it touched, and
+// the blocks that cost the most are logged with the readback summary, together with the same
+// numbers grouped by 16 MiB. It tells which memory the Precise readbacks really matter for.
+struct StallBlock {
+    std::atomic<u64> key{}; // block number + 1, 0 = free
+    std::atomic<u64> calls{};
+    std::atomic<u64> writes{};
+    std::atomic<u64> ns{};
+};
+constexpr size_t StallTableSize = 16384;
+std::array<StallBlock, StallTableSize> stall_blocks;
+const bool stall_log_enabled = Common::Tune("SHAD_STALL_LOG", 1) != 0;
+
+void NoteStall(VAddr addr, bool is_write, u64 ns) {
+    const u64 key = (addr >> 20) + 1;
+    size_t index = (key * 0x9E3779B97F4A7C15ull) >> 50; // 14 bits
+    for (int probe = 0; probe < 16; ++probe, index = (index + 1) % StallTableSize) {
+        auto& block = stall_blocks[index];
+        u64 current = block.key.load(std::memory_order_relaxed);
+        if (current == 0 && block.key.compare_exchange_strong(current, key)) {
+            current = key;
+        }
+        if (current == key) {
+            block.calls.fetch_add(1, std::memory_order_relaxed);
+            block.writes.fetch_add(is_write ? 1 : 0, std::memory_order_relaxed);
+            block.ns.fetch_add(ns, std::memory_order_relaxed);
+            return;
+        }
+    }
+}
+
+void ReportStalls() {
+    struct Entry {
+        u64 block;
+        u64 calls;
+        u64 writes;
+        u64 ns;
+    };
+    std::vector<Entry> blocks;
+    std::map<u64, Entry> groups;
+    u64 total_ns = 0;
+    u64 total_calls = 0;
+    for (auto& block : stall_blocks) {
+        const u64 key = block.key.load(std::memory_order_relaxed);
+        if (key == 0) {
+            continue;
+        }
+        const Entry entry{key - 1, block.calls.exchange(0), block.writes.exchange(0),
+                          block.ns.exchange(0)};
+        block.key.store(0, std::memory_order_relaxed);
+        if (entry.calls == 0) {
+            continue;
+        }
+        blocks.push_back(entry);
+        auto& group = groups[entry.block >> 4];
+        group.block = entry.block >> 4;
+        group.calls += entry.calls;
+        group.writes += entry.writes;
+        group.ns += entry.ns;
+        total_ns += entry.ns;
+        total_calls += entry.calls;
+    }
+    if (blocks.empty()) {
+        return;
+    }
+    const auto by_cost = [](const Entry& a, const Entry& b) { return a.ns > b.ns; };
+    std::ranges::sort(blocks, by_cost);
+    std::string top;
+    for (size_t i = 0; i < std::min<size_t>(blocks.size(), 10); ++i) {
+        const auto& e = blocks[i];
+        top += fmt::format("\n    {:#x}: {:.0f} ms in {} faults ({} writes), {:.2f} ms each",
+                           e.block << 20, e.ns / 1e6, e.calls, e.writes,
+                           e.ns / 1e6 / static_cast<double>(e.calls));
+    }
+    std::vector<Entry> grouped;
+    for (const auto& [_, e] : groups) {
+        grouped.push_back(e);
+    }
+    std::ranges::sort(grouped, by_cost);
+    std::string wide;
+    for (size_t i = 0; i < std::min<size_t>(grouped.size(), 6); ++i) {
+        const auto& e = grouped[i];
+        wide += fmt::format("\n    {:#x}..{:#x}: {:.0f} ms in {} faults ({} writes)", e.block << 24,
+                            ((e.block + 1) << 24) - 1, e.ns / 1e6, e.calls, e.writes);
+    }
+    LOG_INFO(Render,
+             "StallRanges: game threads waited {:.0f} ms in {} faults on the GPU's data in the "
+             "last 10 s; top 1 MiB blocks:{}\n  top 16 MiB regions:{}",
+             total_ns / 1e6, total_calls, top, wide);
+}
+
+} // namespace
+
 std::tuple<const Buffer*, VAddr, VAddr> BufferCache::GetReadbackWindow(VAddr device_addr,
                                                                        u64 size) {
     const u32 first_block = device_addr >> block_shift;
@@ -217,6 +318,7 @@ std::tuple<const Buffer*, VAddr, VAddr> BufferCache::GetReadbackWindow(VAddr dev
 }
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool assume_locks) {
+    const auto stall_start = std::chrono::steady_clock::now();
     const auto download = [this, device_addr, size] {
         const auto [arena, window_start, window_end] = GetReadbackWindow(device_addr, size);
         SettleReadbacks(window_start, window_end);
@@ -246,6 +348,12 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     }
     if (is_write) {
         memory_tracker->MarkRegionAsCpuModified(device_addr, size);
+    }
+    if (stall_log_enabled && !assume_locks) {
+        NoteStall(device_addr, is_write,
+                  std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      std::chrono::steady_clock::now() - stall_start)
+                      .count());
     }
 }
 
@@ -426,6 +534,9 @@ void BufferCache::PrefetchReadbacks() {
 
     if (now - last_readback_report >= std::chrono::seconds{10}) {
         last_readback_report = now;
+        if (stall_log_enabled) {
+            ReportStalls();
+        }
         const double pickups = static_cast<double>(std::max<u64>(readback_stats.pickups, 1));
         LOG_INFO(Render,
                  "Readbacks: {} on game thread faults, {} of those waited for a copy already "
