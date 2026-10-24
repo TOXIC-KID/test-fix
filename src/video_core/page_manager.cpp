@@ -4,6 +4,11 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <string>
+#include <vector>
+#include <fmt/format.h>
 #include <utility>
 #include <boost/container/small_vector.hpp>
 #include "common/adaptive_mutex.h"
@@ -15,6 +20,7 @@
 #include "common/perf_profiler.h"
 #include "common/signal_context.h"
 #include "common/thread.h"
+#include "common/memory_patcher.h"
 #include "common/tuning.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
@@ -509,31 +515,138 @@ struct SignalImpl : public PageManager::Impl {
         impl.Protect(address, size, perms);
     }
 
+    /// Offsets in the eboot of the guest instructions in the flag list `name`, hex, comma
+    /// separated (see MemoryPatcher::GetFlag).
+    static std::vector<u64> ParseSites(const char* name) {
+        std::vector<u64> list;
+        const std::string value = MemoryPatcher::GetFlag(name);
+        for (const char* p = value.c_str(); *p;) {
+            char* end = nullptr;
+            const u64 offset = std::strtoull(p, &end, 16);
+            if (end == p) {
+                break;
+            }
+            list.push_back(offset);
+            p = *end ? end + 1 : end;
+        }
+        if (!list.empty()) {
+            LOG_INFO(Render, "{}: {} guest instruction(s)", name, list.size());
+        }
+        return list;
+    }
+
+    /// The faulting instruction's offset in the eboot, or ~0 when it is somewhere else.
+    static u64 GuestSite(void* context) {
+        const u64 base = MemoryPatcher::g_eboot_address;
+        const u64 rip = reinterpret_cast<u64>(Common::GetRip(context));
+        if (base == 0 || rip < base || rip - base >= MemoryPatcher::g_eboot_image_size) {
+            return ~u64{0};
+        }
+        return rip - base;
+    }
+
+    /// Where game threads spend their time in fault handlers, by faulting instruction. Logged
+    /// every ten seconds with the other stall numbers (SHAD_STALL_LOG).
+    static void NoteFaultSite(u64 site, bool is_write, u64 ns) {
+        struct Entry {
+            std::atomic<u64> key{}; // site + 1
+            std::atomic<u64> calls{};
+            std::atomic<u64> ns{};
+            std::atomic<u64> writes{};
+        };
+        static std::array<Entry, 512> table;
+        static std::atomic<s64> window_start{0};
+        static std::atomic<bool> reporting{false};
+        const u64 key = site + 1;
+        size_t index = (key * 0x9E3779B97F4A7C15ull) >> 55; // 9 bits
+        for (int probe = 0; probe < 16; ++probe, index = (index + 1) % table.size()) {
+            u64 current = table[index].key.load(std::memory_order_relaxed);
+            if (current == 0 && table[index].key.compare_exchange_strong(current, key)) {
+                current = key;
+            }
+            if (current == key) {
+                table[index].calls.fetch_add(1, std::memory_order_relaxed);
+                table[index].ns.fetch_add(ns, std::memory_order_relaxed);
+                table[index].writes.fetch_add(is_write ? 1 : 0, std::memory_order_relaxed);
+                break;
+            }
+        }
+        const s64 now = std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+        s64 start = window_start.load();
+        if (start == 0) {
+            window_start.compare_exchange_strong(start, now);
+            return;
+        }
+        if (now - start < 10 || reporting.exchange(true)) {
+            return;
+        }
+        window_start.store(now);
+        struct Row {
+            u64 site, calls, ns, writes;
+        };
+        std::vector<Row> rows;
+        for (auto& e : table) {
+            const u64 k = e.key.load();
+            if (k != 0) {
+                rows.push_back({k - 1, e.calls.exchange(0), e.ns.exchange(0), e.writes.exchange(0)});
+            }
+        }
+        std::ranges::sort(rows, [](const Row& a, const Row& b) { return a.ns > b.ns; });
+        std::string text;
+        for (size_t i = 0; i < rows.size() && i < 8 && rows[i].ns > 0; ++i) {
+            text += fmt::format("\n    eboot+{:#x}: {:.0f} ms in {} faults ({} writes)",
+                                rows[i].site, rows[i].ns / 1e6, rows[i].calls, rows[i].writes);
+        }
+        if (!text.empty()) {
+            LOG_INFO(Render, "StallSites: time in fault handlers by faulting instruction, last "
+                             "10 s:{}", text);
+        }
+        reporting.store(false);
+    }
+
     static bool GuestFaultSignalHandler(void* context, void* fault_address) {
         Common::Perf::ScopedStall stall{Common::Perf::Stall::PageFault};
         const auto addr = reinterpret_cast<VAddr>(fault_address);
         const auto size = std::min<u64>(8, PageManager::GetNextPageAddr(addr) - addr);
         const auto is_gpu_thread =
             std::this_thread::get_id() == rasterizer->GetGpuCommandProcessorThread();
-        if (Common::IsWriteError(context)) {
-            if (!rasterizer->InvalidateMemory(addr, size, is_gpu_thread)) {
+        static const bool site_log = Common::Tune("SHAD_STALL_LOG", 1) != 0;
+        static const std::vector<u64> nowait_sites = ParseSites("SHADPS4_NOWAIT_WRITES");
+        const bool is_write = Common::IsWriteError(context);
+        const auto started = std::chrono::steady_clock::now();
+        const u64 site = is_gpu_thread ? ~u64{0} : GuestSite(context);
+        const auto note = [&] {
+            if (site_log && site != ~u64{0}) {
+                NoteFaultSite(site, is_write,
+                              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  std::chrono::steady_clock::now() - started)
+                                  .count());
+            }
+        };
+        if (is_write) {
+            const bool no_wait = site != ~u64{0} && !nowait_sites.empty() &&
+                                 std::ranges::find(nowait_sites, site) != nowait_sites.end();
+            if (!(no_wait ? rasterizer->InvalidateMemoryNoWait(addr, size)
+                          : rasterizer->InvalidateMemory(addr, size, is_gpu_thread))) {
                 return false;
             }
             if (!is_gpu_thread) {
                 CountWriteFault(addr);
                 InvalidateAhead(addr);
             }
-            return true;
-        } else {
-            if (!rasterizer->ReadMemory(addr, size, is_gpu_thread)) {
-                return false;
-            }
-            if (!is_gpu_thread) {
-                Common::Perf::Count(Common::Perf::Counter::ReadFaults);
-            }
+            note();
             return true;
         }
-        return false;
+        if (!rasterizer->ReadMemory(addr, size, is_gpu_thread)) {
+            return false;
+        }
+        if (!is_gpu_thread) {
+            Common::Perf::Count(Common::Perf::Counter::ReadFaults);
+        }
+        note();
+        return true;
     }
 
     /// Counts a write fault for the perf summary, telling apart faults on pages that faulted

@@ -443,6 +443,7 @@ std::shared_ptr<BufferCache::Readback> BufferCache::RecordReadback(const Buffer*
     readback->arena_base = arena->cpu_addr;
     readback->start = start;
     readback->end = end;
+    readback->nowait_epoch = nowait_count.load();
     const u64 total_size_bytes = CollectDownloads(arena, start, end - start, readback->copies);
     if (total_size_bytes == 0) {
         return nullptr;
@@ -615,21 +616,80 @@ bool BufferCache::FinishReadback(Readback& readback, bool ahead) {
         return false;
     }
     readback.staging.Invalidate();
-    for (const auto& copy : readback.copies) {
-        auto* dst_addr = std::bit_cast<u8*>(readback.arena_base + copy.srcOffset);
-        memory->TryWriteBacking(
-            dst_addr, readback.staging.mapped + (copy.dstOffset - readback.staging.offset),
-            copy.size);
-    }
-    // The GPU thread marks a readback stale before it marks the memory GPU modified again,
-    // which takes the region locks held while checking here, so a newer write keeps its mark.
+    // Written under the region locks, so a no-wait takeover of one of the pages can't land
+    // between the check and the write.
     const bool unmarked = memory_tracker->UnmarkRegionAsGpuModifiedIf(
-        readback.start, readback.end - readback.start, [&] { return !readback.stale.load(); });
+        readback.start, readback.end - readback.start, [&] {
+            // The GPU thread marks a readback stale before it marks the memory GPU modified
+            // again, which takes the region locks held here, so a newer write keeps its mark.
+            if (readback.stale.load()) {
+                return false;
+            }
+            if (OverlapsNoWait(readback)) {
+                readback.stale.store(true);
+                return false;
+            }
+            for (const auto& copy : readback.copies) {
+                auto* dst_addr = std::bit_cast<u8*>(readback.arena_base + copy.srcOffset);
+                memory->TryWriteBacking(
+                    dst_addr,
+                    readback.staging.mapped + (copy.dstOffset - readback.staging.offset),
+                    copy.size);
+            }
+            return true;
+        });
     if (!unmarked) {
         return false;
     }
     readback.applied_ahead = ahead;
     readback.applied.store(true, std::memory_order_release);
+    return true;
+}
+
+bool BufferCache::OverlapsNoWait(const Readback& readback) {
+    const u64 now = nowait_count.load();
+    if (now == readback.nowait_epoch) {
+        return false;
+    }
+    std::scoped_lock lock{nowait_mutex};
+    const u64 count = nowait_count.load();
+    if (count - readback.nowait_epoch > nowait_pages.size()) {
+        return true; // Too many to tell.
+    }
+    for (u64 i = readback.nowait_epoch; i < count; ++i) {
+        const VAddr page = nowait_pages[i % nowait_pages.size()];
+        for (const auto& copy : readback.copies) {
+            const VAddr copy_start = readback.arena_base + copy.srcOffset;
+            if (copy_start < page + BYTES_PER_PAGE && page < copy_start + copy.size) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool BufferCache::NoWaitWrite(VAddr device_addr) {
+    if (!memory_tracker->IsPrecise()) {
+        return false;
+    }
+    const VAddr page = Common::AlignDown(device_addr, BYTES_PER_PAGE);
+    {
+        // Before the pages change hands, so a copy back finishing meanwhile sees it.
+        std::scoped_lock lock{nowait_mutex};
+        nowait_pages[nowait_count.load() % nowait_pages.size()] = page;
+        nowait_count.fetch_add(1);
+    }
+    memory_tracker->TakeOverRegionNoReadback(page, BYTES_PER_PAGE);
+    // What the GPU wrote there before is dead, in order with the game's commands (GPU writes
+    // recorded after this mark the page again).
+    liverpool->SendCommand<false>([this, page] {
+        gpu_modified_ranges.Subtract(page, BYTES_PER_PAGE);
+        for (auto& hint : gpu_modified_hints) {
+            if (hint.first < page + BYTES_PER_PAGE && page < hint.second) {
+                hint = {};
+            }
+        }
+    });
     return true;
 }
 

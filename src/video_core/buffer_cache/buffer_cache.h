@@ -118,6 +118,12 @@ public:
     /// Flushes any GPU modified buffer in the logical page range back to CPU memory.
     void ReadMemory(VAddr device_addr, u64 size, bool is_write = false, bool assume_locks = false);
 
+    /// A write fault from a game instruction listed as no-wait (SHADPS4_NOWAIT_WRITES): the page
+    /// becomes the CPU's at once, without waiting for the GPU's data in it to be copied back.
+    /// The GPU's bytes in it are dropped. Only for pages the game refills every frame and never
+    /// reads the GPU's part of. Game threads. False when readbacks are not precise.
+    bool NoWaitWrite(VAddr device_addr);
+
     /// Notes memory written straight to its backing, past the page protection, so the GPU copy
     /// of it is uploaded again before it is used.
     void OnBackingWritten(VAddr device_addr, u64 size);
@@ -167,6 +173,8 @@ private:
         VAddr arena_base{};
         VAddr start{};
         VAddr end{};
+        /// Number of no-wait takeovers when it was recorded.
+        u64 nowait_epoch{};
         /// The copy is done once the semaphore of the queue it is on reaches the tick.
         Vulkan::Semaphore* semaphore{};
         u64 tick{};
@@ -293,6 +301,12 @@ private:
     StreamBuffer stream_buffer;
     Buffer gds_buffer;
     RangeSet gpu_modified_ranges;
+    /// Pages taken over by no-wait writes lately, newest last. A copy back recorded before one
+    /// of them must not be written over it.
+    std::mutex nowait_mutex;
+    std::array<VAddr, 256> nowait_pages{};
+    std::atomic<u64> nowait_count{0};
+    bool OverlapsNoWait(const Readback& readback);
     /// Ranges lately found in or added to gpu_modified_ranges, until some of them is taken out.
     std::array<std::pair<VAddr, VAddr>, 16> gpu_modified_hints{};
     size_t next_gpu_modified_hint{};

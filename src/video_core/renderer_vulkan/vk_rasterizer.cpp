@@ -1603,6 +1603,17 @@ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks) {
     return true;
 }
 
+bool Rasterizer::InvalidateMemoryNoWait(VAddr addr, u64 size) {
+    if (!IsMapped(addr, size)) {
+        return false;
+    }
+    if (!buffer_cache.NoWaitWrite(addr)) {
+        buffer_cache.InvalidateMemory(addr, size, false);
+    }
+    texture_cache.InvalidateMemory(addr, size);
+    return true;
+}
+
 void Rasterizer::InvalidateBuffersAhead(VAddr addr, u64 size) {
     // Memory the GPU modified would have to be read back first, which costs more than the faults
     // this saves. Images watch their pages separately, so writes to them still fault.

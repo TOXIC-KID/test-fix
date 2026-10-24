@@ -136,6 +136,22 @@ public:
         });
     }
 
+    /// A write fault the game must not wait for: the pages become CPU modified and no longer GPU
+    /// modified at once, without the GPU's data being copied back first.
+    void TakeOverRegionNoReadback(VAddr cpu_addr, u64 size) noexcept {
+        IteratePages(cpu_addr, size, [](RegionManager* manager, u64 offset, u64 size) {
+            const auto bounds = manager->GetBounds(offset, size);
+            manager->Lock(bounds);
+            manager->template ChangeRegionState<StateOp::Set, StateOp::Clear, false>(offset,
+                                                                                     size);
+            manager->Unlock(bounds);
+        });
+    }
+
+    bool IsPrecise() const noexcept {
+        return readbacks_mode == GpuReadbacksMode::Precise;
+    }
+
     /// Mark region as modified from the CPU where the GPU didn't modify it. Where it did, the
     /// GPU copy is newer than the rest of the memory and has to be kept.
     void MarkRegionAsCpuModifiedUnlessGpuModified(VAddr cpu_addr, u64 size) noexcept {
