@@ -42,6 +42,9 @@ struct patchInfo {
 std::string convertValueToHex(const std::string type, const std::string valueStr);
 
 void OnGameLoaded();
+
+/// Value of NAME from the environment or from NAME=VALUE lines in <user folder>\shadps4-flags.txt.
+std::string GetFlag(const char* name);
 void AddPatchToQueue(const patchInfo& patchToAdd);
 
 void PatchMemory(const patchInfo& patch);

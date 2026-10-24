@@ -1,7 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+#include <mutex>
+#include <set>
+#include <string>
 #include "common/debug.h"
+#include "common/memory_patcher.h"
 #include "common/perf_profiler.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -1000,6 +1005,41 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
     return true;
 }
 
+namespace {
+
+/// Size bound for a read-only buffer binding. inFAMOUS Second Son's skinning vertex shaders (for
+/// example 0x6042bbde and 0x1201d207) bind a small table through a V# whose size reaches the end
+/// of the game's GPU heap, 2.5 GB or more. Bound whole, the buffer cache makes all of it resident:
+/// about 3.1 GB of video memory on a 4 GB card, mostly texture memory no buffer reads. Read-only
+/// bindings above SHADPS4_HUGE_READ_LIMIT_MB (default 1024) are cut to SHADPS4_HUGE_READ_WINDOW_MB
+/// (default 64, 0 = off); reads past the window return zero (robustBufferAccess2). Found by the
+/// iss_pc project (github.com/HayatoG/iss_pc), which measured 5.6 GB -> 3.2 GB on an RTX 2060.
+u64 ClampHugeRead(u64 size, bool written, u64 pgm_hash) {
+    static const u64 window = [] {
+        const std::string v = MemoryPatcher::GetFlag("SHADPS4_HUGE_READ_WINDOW_MB");
+        return (v.empty() ? u64{64} : std::strtoull(v.c_str(), nullptr, 10)) << 20;
+    }();
+    static const u64 limit = [] {
+        const std::string v = MemoryPatcher::GetFlag("SHADPS4_HUGE_READ_LIMIT_MB");
+        return (v.empty() ? u64{1024} : std::strtoull(v.c_str(), nullptr, 10)) << 20;
+    }();
+    if (written || window == 0 || size <= limit || size <= window) {
+        return size;
+    }
+    static std::mutex mutex;
+    static std::set<u64> seen;
+    {
+        std::scoped_lock lock{mutex};
+        if (seen.size() < 64 && seen.insert(pgm_hash).second) {
+            LOG_INFO(Render, "HugeRead: read-only binding of {} MB in stage {:#x} cut to {} MB",
+                     size >> 20, pgm_hash, window >> 20);
+        }
+    }
+    return window;
+}
+
+} // namespace
+
 void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                              Shader::PushData& push_data) {
     const u64 alignment = instance.StorageMinAlignment();
@@ -1060,11 +1100,13 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             if (vsharp.base_address == 0 || vsharp.GetSize() == 0) {
                 buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
             } else {
-                const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
-                if (size != vsharp.GetSize()) {
+                const u64 mapped_size =
+                    memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
+                if (mapped_size != vsharp.GetSize()) {
                     LOG_ERROR(Render, "Clamped size from {} to {} for stage {:#x}",
-                              vsharp.GetSize(), size, stage.pgm_hash);
+                              vsharp.GetSize(), mapped_size, stage.pgm_hash);
                 }
+                const u64 size = ClampHugeRead(mapped_size, desc.is_written, stage.pgm_hash);
                 // Accesses are reported to the runtime with the bound buffers after the draw.
                 bool unwritten = false;
                 const auto [buffer, offset] =

@@ -232,7 +232,7 @@ void ApplyPatchesFromXML(std::filesystem::path path) {
 //   SHADPS4_PERF_MODE=low              the game's own lower settings (less GPU work and video memory)
 //   SHADPS4_PARTICLE_LATE_READ=1       read particle results one frame later (no mid-frame GPU wait)
 //   SHADPS4_PARTICLE_LIGHT_ONE_SUBMIT=1  one ring submit instead of one per light (needs the above)
-static std::string GetPatchFlag(const char* name) {
+std::string GetFlag(const char* name) {
     if (const char* env = std::getenv(name)) {
         return env;
     }
@@ -289,7 +289,7 @@ static bool g_particle_late_read_applied = false;
 // after kicking the frame's particle work, so Game:Main waits for the GPU mid-frame. This moves
 // that read to the start of the next frame, just before the data is consumed.
 static void ApplyParticleLateRead() {
-    if (GetPatchFlag("SHADPS4_PARTICLE_LATE_READ") != "1") {
+    if (GetFlag("SHADPS4_PARTICLE_LATE_READ") != "1") {
         return;
     }
     const std::vector<PatchSite> sites = {
@@ -331,7 +331,7 @@ static void ApplyParticleLateRead() {
 // each one (about 25 submits per fight frame). With the late read the copies go out with the
 // frame's first submit anyway, so the per-light submit becomes a NOP.
 static void ApplyParticleLightOneSubmit() {
-    if (GetPatchFlag("SHADPS4_PARTICLE_LIGHT_ONE_SUBMIT") != "1") {
+    if (GetFlag("SHADPS4_PARTICLE_LIGHT_ONE_SUBMIT") != "1") {
         return;
     }
     if (!g_particle_late_read_applied) {
@@ -355,7 +355,7 @@ static void ApplyParticleLightOneSubmit() {
 //   office: LOD scale 0.5, one cascade less, particles at quarter resolution, no hi-res blocks,
 //           half the pedestrians
 static void ApplyPerfMode() {
-    const std::string mode = GetPatchFlag("SHADPS4_PERF_MODE");
+    const std::string mode = GetFlag("SHADPS4_PERF_MODE");
     const bool low = mode == "low" || mode == "1";
     const bool office = mode == "office" || mode == "2";
     if (!low && !office) {
